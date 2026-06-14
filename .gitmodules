@@ -1,0 +1,6 @@
+[submodule "submodules/cv_lane_detection"]
+	path = submodules/cv_lane_detection
+	url = https://github.com/Aleksa021/driving-lane-departure-warning
+[submodule "submodules/ml_lane_detection"]
+	path = submodules/ml_lane_detection
+	url = https://github.com/Aleksa021/Ultra-Fast-Lane-Detection-v2
