@@ -1,22 +1,15 @@
 """ML lane detector: Ultra-Fast-Lane-Detection-v2 (UFLDv2) on a TensorRT engine.
 
-Refactored from the reference script trt_test_speed.py into a reusable detector
-that conforms to the shared LaneDetector contract (see base.py): detect() returns
-the two ego-lane boundaries as points in undistorted original-image pixels.
+A reusable detector (from the reference trt_test_speed.py) conforming to the
+LaneDetector contract: detect() returns the two ego-lane boundaries as points in
+undistorted original-image pixels.
 
-Two mapping bugs from the reference script are fixed here:
-
-* Vertical (y) mapping. The reference spread the model's row classes uniformly
-  over the whole cropped strip. In reality each class k sits at normalized input
-  height v_k = (row_anchor[k] - (1 - crop_ratio)) / crop_ratio, with
-  row_anchor = linspace(0.42, 1, num_cls_row) and crop_ratio = 0.6 (from the
-  training config). Ignoring this placed every point too high (toward the
-  horizon) by up to ~20 px. We now invert the true mapping.
-
-* Horizontal (x) mapping. The reference took a global softmax over all grid
-  cells. The trained/evaluated behaviour (deploy reference + demo.py) is a
-  softmax over a local window around the argmax, plus a +0.5 cell offset. We use
-  the local-window expectation here.
+Decoding matches how UFLDv2 was trained, fixing two bugs in the reference:
+  * y: class k sits at input-height v_k = (row_anchor[k]-(1-crop_ratio))/crop_ratio
+    (row_anchor = linspace(0.42,1,num_cls_row), crop_ratio = 0.6), not uniformly
+    over the crop -- the reference placed points up to ~20 px too high.
+  * x: expectation over a local window around the argmax (+0.5 cell), not a
+    global softmax over all grid cells.
 """
 
 import ctypes
@@ -187,41 +180,42 @@ class MLLaneDetector:
         std = torch.from_numpy(_STD).to(device).view(1, -1, 1, 1)
         return (img - mean) / std
 
-    # ---- decoding -----------------------------------------------------------
-    def _decode_x(self, loc_row: np.ndarray, k: int, lane: int) -> float:
-        """Local-window softmax expectation over the grid dim -> original-image x."""
-        col = loc_row[:, k, lane]                       # [num_grid_row]
-        amax = int(np.argmax(col))
-        lo = max(0, amax - self.local_width)
-        hi = min(self.num_grid_row - 1, amax + self.local_width) + 1
-        idx = np.arange(lo, hi)
-        w = col[lo:hi]
-        w = np.exp(w - w.max())
-        w = w / w.sum()
-        g = float((w * idx).sum()) + 0.5             # expected grid cell (+0.5 like the reference)
+    # ---- decoding (vectorized over all classes and both lanes) --------------
+    def _decode_x(self, logits: np.ndarray) -> np.ndarray:
+        """logits [num_grid, num_cls, L] -> original-image x [num_cls, L].
 
-        # Remove black-bar padding, then scale to original width.
-        u = g / (self.num_grid_row - 1)              # [0,1] across the padded input width
+        Per (class, lane): softmax-weighted mean grid index over a window of
+        +/-local_width around the argmax (+0.5), then black-bar removal + scale.
+        """
+        G = self.num_grid_row
+        amax = logits.argmax(0)                                  # [C, L]
+        offsets = np.arange(-self.local_width, self.local_width + 1)
+        raw = amax[None] + offsets[:, None, None]                # [win, C, L]
+        in_range = (raw >= 0) & (raw < G)
+        idx = np.clip(raw, 0, G - 1)
+
+        w = np.take_along_axis(logits, idx, axis=0)              # [win, C, L]
+        w = np.where(in_range, w, -np.inf)                       # ignore clipped neighbours
+        w = np.exp(w - w.max(0, keepdims=True))
+        w /= w.sum(0, keepdims=True)
+        g = (w * idx).sum(0) + 0.5                               # [C, L]
+
         ratio = self.black_bar_ratio
-        u_img = (u - ratio / 2.0) / (1.0 - ratio)    # [0,1] across the image content
-        return u_img * self.W
+        return ((g / (G - 1) - ratio / 2.0) / (1.0 - ratio)) * self.W
 
     def _pred2coords(self, pred: dict) -> LaneList:
-        loc_row = pred["loc_row"][0]                 # [num_grid_row, num_cls_row, num_lane_row]
-        exist_row = pred["exist_row"][0]             # [2, num_cls_row, num_lane_row]
-        valid = exist_row.argmax(0).astype(bool)     # [num_cls_row, num_lane_row]
+        lane_idx = self.row_lane_idx
+        logits = pred["loc_row"][0][:, :, lane_idx]              # [num_grid, num_cls, L]
+        valid = pred["exist_row"][0].argmax(0)[:, lane_idx].astype(bool)  # [num_cls, L]
+        x = self._decode_x(logits)                              # [num_cls, L]
 
         lanes: List[np.ndarray] = []
-        for lane in self.row_lane_idx:
-            if valid[:, lane].sum() <= self.num_cls_row / 2:
+        for j in range(len(lane_idx)):
+            m = valid[:, j]
+            if m.sum() <= self.num_cls_row / 2:
                 lanes.append(EMPTY_LANE)
-                continue
-            pts = [
-                (self._decode_x(loc_row, k, lane), self.yi[k])
-                for k in range(self.num_cls_row)
-                if valid[k, lane]
-            ]
-            lanes.append(np.array(pts, dtype=np.float32) if pts else EMPTY_LANE)
+            else:
+                lanes.append(np.column_stack([x[m, j], self.yi[m]]).astype(np.float32))
         return lanes
 
     def _undistort(self, lane: np.ndarray) -> np.ndarray:
