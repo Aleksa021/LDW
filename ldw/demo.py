@@ -81,6 +81,10 @@ def draw(frame, result):
         cv2.polylines(frame, [poly], isClosed=False, color=color, thickness=3, lineType=cv2.LINE_AA)
         for x, y in poly:
             cv2.circle(frame, (int(x), int(y)), 3, (0, 255, 0), -1)
+    def fmt(v):
+        return f"{v:+.2f}m" if v is not None else "--"
+    cv2.putText(frame, f"L:{fmt(result.dist_left_m)}  R:{fmt(result.dist_right_m)}  off:{fmt(result.offset_m)}",
+                (50, 160), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
     if result.warning:
         cv2.putText(frame, "WARNING: Lane Departure!", (50, 100),
                     cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255), 3)
