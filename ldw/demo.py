@@ -51,7 +51,7 @@ def build_ml():
     cam = CameraConfig(name="centar_grada", image_size=(1920, 1080),
                        distortion_model="pinhole", K=ML_K, D=ML_D, cv_roi=None, H=ML_H)
     det = MLLaneDetector(os.path.join(ML_DIR, "resources", "culane_res34.engine"),
-                         dataset="culane", image_size=cam.image_size)
+                         dataset="culane", image_size=cam.image_size, side_pad=0.5, crop_ratio=750/1080)
     video = os.path.join(ML_DIR, "centar_grada_kraci.mp4")
     return LDWSystem(det, cam), video
 

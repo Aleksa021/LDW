@@ -4,12 +4,14 @@ Conforms to the LaneDetector contract: detect() returns the two ego-lane
 boundaries as points in RAW original-image pixels (no undistortion — that is the
 LDW layer's job).
 
-Preprocessing replicates UFLDv2's: resize the full frame width to the engine
-input and feed the bottom `crop_ratio` of the image. Decoding then maps each row
-class to its original-image row (y = row_anchor * H) and decodes x as a
-softmax-weighted mean grid index over a local window around the argmax. The two
-supported engines differ only in `crop_ratio` and `row_anchor` (see
-ENGINE_PRESETS), selected by the `dataset` argument.
+Preprocessing feeds the bottom `crop_ratio` of the frame, resized into the centre
+`(1 - side_pad)` of the engine input width with zero side-padding. `side_pad` and
+the `crop_ratio` override (both no-ops by default) exist to make a narrow-FOV
+camera look like the model's training data — without them a small-FOV camera
+(e.g. centar_grada) detects poorly. Decoding inverts both: y maps each row class
+to its original-image row, x is a softmax-weighted mean grid index (local window
+around the argmax) corrected for the side padding. The two engines differ in
+their training `crop_ratio` and `row_anchor` (ENGINE_PRESETS), chosen by `dataset`.
 """
 
 import ctypes
@@ -134,15 +136,21 @@ class MLLaneDetector:
     """UFLDv2 ego-lane detector. Conforms to the LaneDetector contract.
 
     Returns the two ego-lane boundaries as raw original-image pixels. `dataset`
-    selects the engine decode preset ("culane" or "tusimple").
+    selects the engine decode preset ("culane" or "tusimple"). `side_pad` (0..1)
+    centres the frame in the input width with zero side-bars, and `crop_ratio`
+    overrides the preset's vertical crop — both tune a camera's FOV to match the
+    model's training appearance; defaults reproduce plain full-width preprocessing.
     """
 
-    def __init__(self, engine_path, dataset, image_size=(1920, 1080), local_width=1):
+    def __init__(self, engine_path, dataset, image_size=(1920, 1080),
+                 side_pad=0.0, crop_ratio=None, local_width=1):
         if dataset not in ENGINE_PRESETS:
             raise ValueError(f"dataset must be one of {list(ENGINE_PRESETS)}")
         preset = ENGINE_PRESETS[dataset]
-        crop_ratio = preset["crop_ratio"]
+        self.train_crop = preset["crop_ratio"]      # training crop (for anchor math)
         a0, a1 = preset["row_anchor"]
+        self.crop_ratio = self.train_crop if crop_ratio is None else float(crop_ratio)
+        self.side_pad = float(side_pad)
         self.local_width = local_width
 
         self.model = _TRTModel(engine_path)
@@ -155,11 +163,19 @@ class MLLaneDetector:
         self.num_grid_row = int(loc_row_shape[1])
         self.num_cls_row = int(loc_row_shape[2])
 
-        # Preprocessing feeds the bottom crop_ratio of the frame (full width). Row
-        # anchors are fractions of the FULL image height, so class k sits at
-        # original-image row yi[k] = row_anchor[k] * H.
-        self.crop_rows = int(round(crop_ratio * self.H))
-        self.yi = np.linspace(a0, a1, self.num_cls_row) * self.H
+        # Horizontal: the resized frame occupies the centre (1 - side_pad) of the
+        # input width; the rest is zero-padded (mimics a wider-FOV training image).
+        self._content_w = max(1, int(round(self.train_width * (1.0 - self.side_pad))))
+        total_pad = self.train_width - self._content_w
+        self._pad_l, self._pad_r = total_pad // 2, total_pad - total_pad // 2
+
+        # Vertical: feed the bottom crop_ratio of the frame. Row anchors are fractions
+        # of the image height under the TRAINING crop; map each class to its original
+        # row for the (possibly different) deploy crop. Reduces to row_anchor*H when
+        # the deploy crop equals the training crop.
+        self.crop_rows = int(round(self.crop_ratio * self.H))
+        n = (np.linspace(a0, a1, self.num_cls_row) - (1.0 - self.train_crop)) / self.train_crop
+        self.yi = (self.H - self.crop_rows) + n * self.crop_rows
 
     # ---- preprocessing (GPU) ------------------------------------------------
     def _preprocess(self, frame: np.ndarray) -> torch.Tensor:
@@ -167,8 +183,10 @@ class MLLaneDetector:
         frame = frame[-self.crop_rows:, :, :]  # bottom crop_ratio of the image
         img = torch.from_numpy(frame).pin_memory().to(device, non_blocking=True, dtype=torch.float32)
         img = (img / 255.0).permute(2, 0, 1).unsqueeze(0)
-        img = F.interpolate(img, size=(self.train_height, self.train_width),
+        img = F.interpolate(img, size=(self.train_height, self._content_w),
                             mode="bilinear", align_corners=False)
+        if self._pad_l or self._pad_r:  # zero side-bars to centre the content
+            img = F.pad(img, (self._pad_l, self._pad_r, 0, 0), mode="constant", value=0.0)
         mean = torch.from_numpy(_MEAN).to(device).view(1, -1, 1, 1)
         std = torch.from_numpy(_STD).to(device).view(1, -1, 1, 1)
         return (img - mean) / std
@@ -178,7 +196,8 @@ class MLLaneDetector:
         """logits [num_grid, num_cls, L] -> original-image x [num_cls, L].
 
         Per (class, lane): softmax-weighted mean grid index over a window of
-        +/-local_width around the argmax (+0.5 cell), scaled to image width.
+        +/-local_width around the argmax (+0.5 cell), then undo the side padding
+        and scale to image width.
         """
         G = self.num_grid_row
         amax = logits.argmax(0)                                  # [C, L]
@@ -192,7 +211,7 @@ class MLLaneDetector:
         w = np.exp(w - w.max(0, keepdims=True))
         w /= w.sum(0, keepdims=True)
         g = (w * idx).sum(0) + 0.5                               # [C, L]
-        return g / (G - 1) * self.W
+        return (g / (G - 1) - self.side_pad / 2.0) / (1.0 - self.side_pad) * self.W
 
     def _pred2coords(self, pred: dict) -> LaneList:
         logits = pred["loc_row"][0][:, :, ROW_LANE_IDX]                   # [num_grid, num_cls, L]
