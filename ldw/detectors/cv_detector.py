@@ -2,7 +2,17 @@
 
 A self-contained, size-agnostic, stateless ego-lane detector conforming to the
 LaneDetector contract: detect() returns the two ego-lane boundaries as points in
-(optionally undistorted) original-image pixels.
+**original input-image pixels** (the same coordinate frame the image was passed
+in).
+
+Lens undistortion is handled internally: the frame is rectified for processing
+(lanes are straight/parallel in a rectilinear view, which the perspective warp
+and polynomial fit assume), then the detected lane points are re-distorted back
+into the original image space before returning. Two distortion models are
+supported via `distortion_model`:
+  * "fisheye" - OpenCV fisheye model (4x1 D); used for the Jiqing Expressway cam.
+  * "pinhole" - Brown-Conrady k1,k2,p1,p2 (and optional k3); for the e-con cam.
+  * None      - no calibration; detect on the raw frame, output raw.
 
 The algorithm originates from the cv_lane_detection submodule's reference
 pipeline (gradient/HLS thresholding -> perspective warp -> sliding-window
@@ -13,6 +23,7 @@ visualization) is intentionally omitted; it belongs to the LDW layer.
 Pipeline (per frame, no state carried between calls):
     undistort -> downscale -> edge mask -> warp to internal BEV -> crop
     -> sliding-window search -> polynomial fit -> sample -> unwarp + upscale
+    -> re-distort points to the original image space
 """
 
 import cv2
@@ -64,7 +75,6 @@ DEFAULT_SPATIAL = {
     "min_fit_pixels": 50,        # min inlier pixels (working res) to attempt a fit
 }
 
-CALIB_REF_SIZE = (1280, 720)  # resolution the bundled calibration pickle was computed at
 NWINDOWS = 9
 
 
@@ -180,9 +190,9 @@ class CVLaneDetector:
         or EMPTY_LANE (0, 2) when that lane is not reliably found.
     """
 
-    def __init__(self, image_size, calibration=None, proc_downscale=4,
-                 roi=DEFAULT_ROI, edge_thresholds=DEFAULT_THRESHOLDS,
-                 spatial=DEFAULT_SPATIAL, calib_size=CALIB_REF_SIZE):
+    def __init__(self, image_size, calibration=None, distortion_model=None,
+                 proc_downscale=4, roi=DEFAULT_ROI, edge_thresholds=DEFAULT_THRESHOLDS,
+                 spatial=DEFAULT_SPATIAL, undistort_balance=0.0):
         self.W, self.H = int(image_size[0]), int(image_size[1])
         self.proc_downscale = proc_downscale
         self.edge_thresholds = edge_thresholds
@@ -198,14 +208,28 @@ class CVLaneDetector:
         self.M = cv2.getPerspectiveTransform(src, dst)
         self.M_inv = cv2.getPerspectiveTransform(dst, src)
 
-        # Calibration, scaled to the input resolution if needed.
-        self.mtx = None
-        self.dist = None
-        if calibration is not None:
-            mtx, dist = calibration
-            self.mtx = self._scale_mtx(np.array(mtx, dtype=np.float64), calib_size,
-                                       (self.W, self.H))
-            self.dist = np.array(dist, dtype=np.float64)
+        # Calibration: precompute the rectify map (frame) + Knew (for re-distorting
+        # detected points back to the original image). K/D are assumed to match
+        # image_size. distortion_model selects the lens model.
+        self.calibrated = calibration is not None
+        if self.calibrated:
+            if distortion_model not in ("fisheye", "pinhole"):
+                raise ValueError(
+                    "distortion_model must be 'fisheye' or 'pinhole' when calibration is given")
+            self.dmodel = distortion_model
+            self.K = np.asarray(calibration[0], dtype=np.float64).reshape(3, 3)
+            self.D = np.asarray(calibration[1], dtype=np.float64).reshape(-1, 1)
+            size = (self.W, self.H)
+            if distortion_model == "fisheye":
+                self.Knew = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
+                    self.K, self.D, size, np.eye(3), balance=undistort_balance)
+                self.map1, self.map2 = cv2.fisheye.initUndistortRectifyMap(
+                    self.K, self.D, np.eye(3), self.Knew, size, cv2.CV_16SC2)
+            else:  # pinhole (Brown-Conrady k1,k2,p1,p2[,k3])
+                self.Knew, _ = cv2.getOptimalNewCameraMatrix(
+                    self.K, self.D, size, undistort_balance, size)
+                self.map1, self.map2 = cv2.initUndistortRectifyMap(
+                    self.K, self.D, None, self.Knew, size, cv2.CV_16SC2)
 
         # Precompute spatial constants in working pixels.
         self.margin = max(1, int(round(spatial["margin_frac"] * self.work_W)))
@@ -215,24 +239,26 @@ class CVLaneDetector:
         self.parallel_std = spatial["parallel_std_frac"] * self.work_W
         self.min_fit_pixels = spatial["min_fit_pixels"]
 
-    @staticmethod
-    def _scale_mtx(mtx, calib_size, target_size):
-        sx = target_size[0] / calib_size[0]
-        sy = target_size[1] / calib_size[1]
-        m = mtx.copy()
-        m[0, 0] *= sx
-        m[0, 2] *= sx
-        m[1, 1] *= sy
-        m[1, 2] *= sy
-        return m
+    def _redistort(self, pts):
+        """Map points from the rectified (Knew) frame back to original pixels."""
+        if pts is None or len(pts) == 0:
+            return pts
+        norm = (pts.astype(np.float64) - [self.Knew[0, 2], self.Knew[1, 2]]) \
+            / [self.Knew[0, 0], self.Knew[1, 1]]
+        if self.dmodel == "fisheye":
+            d = cv2.fisheye.distortPoints(norm.reshape(1, -1, 2), self.K, self.D)
+        else:  # pinhole: project normalized rays through K + D
+            obj = np.hstack([norm, np.ones((len(norm), 1))]).reshape(-1, 1, 3)
+            d, _ = cv2.projectPoints(obj, np.zeros(3), np.zeros(3), self.K, self.D)
+        return d.reshape(-1, 2).astype(np.float32)
 
     def detect(self, image_bgr: np.ndarray) -> LaneList:
-        # 1. Undistort (optional).
-        if self.mtx is not None:
-            image_bgr = cv2.undistort(image_bgr, self.mtx, self.dist, None, self.mtx)
+        # 1. Undistort the frame for processing (lanes become rectilinear).
+        proc = cv2.remap(image_bgr, self.map1, self.map2, cv2.INTER_LINEAR) \
+            if self.calibrated else image_bgr
 
         # 2. Downscale to working resolution.
-        work = cv2.resize(image_bgr, (self.work_W, self.work_H))
+        work = cv2.resize(proc, (self.work_W, self.work_H))
 
         # 3. Edge mask.
         mask = find_edges(work, self.edge_thresholds)
@@ -259,9 +285,14 @@ class CVLaneDetector:
             if np.std(right_fitx - left_fitx) >= self.parallel_std:
                 left_fitx = right_fitx = None
 
-        # 8. Unwarp + upscale each lane to original-image pixels.
-        left_pts = self._to_original(left_fitx, ploty) if left_fitx is not None else EMPTY_LANE
-        right_pts = self._to_original(right_fitx, ploty) if right_fitx is not None else EMPTY_LANE
+        # 8. Unwarp + upscale each lane to rectified full-res pixels.
+        left_pts = self._to_rectified(left_fitx, ploty) if left_fitx is not None else EMPTY_LANE
+        right_pts = self._to_rectified(right_fitx, ploty) if right_fitx is not None else EMPTY_LANE
+
+        # 9. Re-distort back to the original input-image space.
+        if self.calibrated:
+            left_pts = self._redistort(left_pts)
+            right_pts = self._redistort(right_pts)
         return [left_pts, right_pts]
 
     @staticmethod
@@ -270,8 +301,8 @@ class CVLaneDetector:
             return None
         return fit[0] * ploty ** 2 + fit[1] * ploty + fit[2]
 
-    def _to_original(self, fitx, ploty):
-        """BEV (working) polyline -> original-image pixel points."""
+    def _to_rectified(self, fitx, ploty):
+        """BEV (working) polyline -> rectified full-res pixel points."""
         pts = np.stack([fitx, ploty], axis=1).reshape(-1, 1, 2).astype(np.float32)
         cam = cv2.perspectiveTransform(pts, self.M_inv).reshape(-1, 2)
         return cam * self.proc_downscale

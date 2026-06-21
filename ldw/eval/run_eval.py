@@ -11,8 +11,9 @@ python -m ldw.eval.run_eval --detector cv --videos 0249 0250 0251 \
        --stride 5 --out results_cv.json
 
 Detectors: cv | ml-culane | ml-tusimple.
-Scoring space: ml-* in raw pixels; cv in fisheye-undistorted pixels (frame and
-GT undistorted with the dataset calibration).
+Scoring space: raw original-image pixels for all detectors (GT used as-is). CV
+undistorts (fisheye) internally for processing and re-distorts its output back to
+the original frame; ML runs on the raw frame.
 """
 
 import argparse
@@ -23,7 +24,7 @@ from typing import List, Optional
 import cv2
 import numpy as np
 
-from ldw.eval.calib import FisheyeRectifier, load_parameters
+from ldw.eval.calib import load_parameters
 from ldw.eval.gt import load_video_gt, parse_gt_file, select_ego_pair
 from ldw.eval.metrics import CULaneAccumulator, TuSimpleAccumulator, clip_to_yrange
 
@@ -54,25 +55,26 @@ JIQING_CV_ROI = {
 
 
 def build_detector(kind: str, size):
-    """Return (detector, undistort_for_cv: bool). Detectors run calibration=None."""
+    """Build a detector. All detectors output lanes in raw original-image pixels:
+    CV undistorts (fisheye) internally and re-distorts its output; ML runs on the
+    raw frame (calibration=None)."""
     W, H = size
     if kind == "cv":
         from ldw.detectors.cv_detector import CVLaneDetector
-        return CVLaneDetector(image_size=(W, H), calibration=None, roi=JIQING_CV_ROI), True
+        return CVLaneDetector(image_size=(W, H), calibration=load_parameters(PARAMS),
+                              distortion_model="fisheye", roi=JIQING_CV_ROI)
     from ldw.detectors.ml_detector import MLLaneDetector
     if kind == "ml-culane":
-        det = MLLaneDetector(
+        return MLLaneDetector(
             ENGINES[kind], image_size=(W, H), calibration=None,
             crop_ratio=0.6, row_anchor_start=0.42, row_anchor_end=1.0,
             last_n_rows=int(0.6 * H), black_bar_ratio=0.0, row_lane_idx=(1, 2))
-    elif kind == "ml-tusimple":
-        det = MLLaneDetector(
+    if kind == "ml-tusimple":
+        return MLLaneDetector(
             ENGINES[kind], image_size=(W, H), calibration=None,
             crop_ratio=0.8, row_anchor_start=160 / 720, row_anchor_end=710 / 720,
             last_n_rows=int(0.8 * H), black_bar_ratio=0.0, row_lane_idx=(1, 2))
-    else:
-        raise ValueError(f"unknown detector: {kind}")
-    return det, False
+    raise ValueError(f"unknown detector: {kind}")
 
 
 def _nonempty(lane: np.ndarray) -> Optional[np.ndarray]:
@@ -94,8 +96,7 @@ def evaluate(kind: str, videos: List[str], stride: int, max_frames: int,
     H = int(cap0.get(cv2.CAP_PROP_FRAME_HEIGHT))
     cap0.release()
 
-    detector, do_undistort = build_detector(kind, (W, H))
-    rect = FisheyeRectifier(*load_parameters(PARAMS), image_size=(W, H)) if do_undistort else None
+    detector = build_detector(kind, (W, H))
 
     if overlay_dir:
         os.makedirs(overlay_dir, exist_ok=True)
@@ -122,10 +123,6 @@ def evaluate(kind: str, videos: List[str], stride: int, max_frames: int,
                 continue
 
             gt_lanes = parse_gt_file(gt_map[fidx])
-            if do_undistort:
-                frame = rect.undistort_image(frame)
-                gt_lanes = [rect.undistort_points(l) for l in gt_lanes]
-
             gt_left, gt_right = select_ego_pair(gt_lanes, W, H)
             pred = detector.detect(frame)
             pred_left = _nonempty(pred[0]) if len(pred) > 0 else None
@@ -158,7 +155,7 @@ def evaluate(kind: str, videos: List[str], stride: int, max_frames: int,
         "detector": kind,
         "videos": videos,
         "stride": stride,
-        "scoring_space": "fisheye_undistorted" if do_undistort else "raw",
+        "scoring_space": "raw",  # all detectors output original-image pixels
         "line_width": line_width,
         "pix_thresh": pix_thresh,
         "overall": {"culane": overall_cu.summary(), "tusimple": overall_ts.summary()},
