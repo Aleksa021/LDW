@@ -6,9 +6,10 @@ use either one interchangeably:
     detect(frame_bgr) -> [left_pts, right_pts]
 
 where each element is an (N, 2) float32 array of (x, y) points in
-**undistorted original-image pixels** (or an empty (0, 2) array when that lane
-is not found). The LDW layer then projects these into a single common BEV via
-the calibrated homography H.
+**raw original-image pixels** — the same coordinate frame the image was passed
+in (or an empty (0, 2) array when that lane is not found). Undistortion is NOT
+applied to detector output: the LDW layer undistorts (with the camera's K/D)
+and then projects into a common BEV via the homography H.
 """
 
 from typing import List, Protocol

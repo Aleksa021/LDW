@@ -24,14 +24,13 @@ from typing import List, Optional
 import cv2
 import numpy as np
 
-from ldw.eval.calib import load_parameters
+from ldw.cameras import JIQING
 from ldw.eval.gt import load_video_gt, parse_gt_file, select_ego_pair
 from ldw.eval.metrics import CULaneAccumulator, TuSimpleAccumulator, clip_to_yrange
 
 DATASET = "/media/aleksa21/NVme Data/Datasets/Jiqing_Expressway"
 VIDEO_DIR = os.path.join(DATASET, "Videos")
 GT_ROOT = os.path.join(DATASET, "Lane_Parameters")
-PARAMS = os.path.join(DATASET, "parameters.yml")
 
 _RES = os.path.join(os.path.dirname(__file__), "..", "..",
                     "submodules", "ml_lane_detection", "resources")
@@ -45,35 +44,19 @@ def video_path(vid: str) -> str:
     return os.path.join(VIDEO_DIR, f"IMG_{vid}.MOV")
 
 
-# CV perspective trapezoid tuned for the Jiqing camera in fisheye-undistorted
-# space (fractions of W,H; order BL, BR, TR, TL). Derived from the undistorted
-# ego-lane geometry; the detector's own DEFAULT_ROI is left untouched.
-JIQING_CV_ROI = {
-    "src": [(0.22, 0.86), (0.78, 0.86), (0.575, 0.60), (0.445, 0.60)],
-    "dst": [(0.2266, 1.0), (0.7734, 1.0), (0.7734, 0.0), (0.2266, 0.0)],
-}
-
-
-def build_detector(kind: str, size):
-    """Build a detector. All detectors output lanes in raw original-image pixels:
-    CV undistorts (fisheye) internally and re-distorts its output; ML runs on the
-    raw frame (calibration=None)."""
-    W, H = size
+def build_detector(kind: str):
+    """Build a detector for the Jiqing camera. All detectors output lanes in raw
+    original-image pixels: CV undistorts (fisheye) internally and re-distorts its
+    output; ML runs on the raw frame."""
     if kind == "cv":
         from ldw.detectors.cv_detector import CVLaneDetector
-        return CVLaneDetector(image_size=(W, H), calibration=load_parameters(PARAMS),
-                              distortion_model="fisheye", roi=JIQING_CV_ROI)
+        return CVLaneDetector(image_size=JIQING.image_size, roi=JIQING.cv_roi,
+                              calibration=JIQING.calibration,
+                              distortion_model=JIQING.distortion_model)
     from ldw.detectors.ml_detector import MLLaneDetector
-    if kind == "ml-culane":
-        return MLLaneDetector(
-            ENGINES[kind], image_size=(W, H), calibration=None,
-            crop_ratio=0.6, row_anchor_start=0.42, row_anchor_end=1.0,
-            last_n_rows=int(0.6 * H), black_bar_ratio=0.0, row_lane_idx=(1, 2))
-    if kind == "ml-tusimple":
-        return MLLaneDetector(
-            ENGINES[kind], image_size=(W, H), calibration=None,
-            crop_ratio=0.8, row_anchor_start=160 / 720, row_anchor_end=710 / 720,
-            last_n_rows=int(0.8 * H), black_bar_ratio=0.0, row_lane_idx=(1, 2))
+    if kind in ("ml-culane", "ml-tusimple"):
+        dataset = "culane" if kind == "ml-culane" else "tusimple"
+        return MLLaneDetector(ENGINES[kind], dataset=dataset, image_size=JIQING.image_size)
     raise ValueError(f"unknown detector: {kind}")
 
 
@@ -96,7 +79,7 @@ def evaluate(kind: str, videos: List[str], stride: int, max_frames: int,
     H = int(cap0.get(cv2.CAP_PROP_FRAME_HEIGHT))
     cap0.release()
 
-    detector = build_detector(kind, (W, H))
+    detector = build_detector(kind)
 
     if overlay_dir:
         os.makedirs(overlay_dir, exist_ok=True)

@@ -38,24 +38,8 @@ __all__ = ["CVLaneDetector"]
 # Defaults
 # ---------------------------------------------------------------------------
 
-# Perspective-transform trapezoid as FRACTIONS of (width, height). Derived from
-# the original lane.py points defined for 1280x720, re-expressed as ratios so the
-# trapezoid auto-scales to any resolution / aspect ratio.
-#   order: bottom-left, bottom-right, top-right, top-left
-DEFAULT_ROI = {
-    "src": [
-        (194 / 1280, 719 / 720),
-        (1117 / 1280, 719 / 720),
-        (705 / 1280, 461 / 720),
-        (575 / 1280, 461 / 720),
-    ],
-    "dst": [
-        (290 / 1280, 719 / 720),
-        (990 / 1280, 719 / 720),
-        (990 / 1280, 0.0),
-        (290 / 1280, 0.0),
-    ],
-}
+# The perspective-transform trapezoid (`roi`) is camera-specific and supplied by
+# the caller (see ldw/cameras.py); fractions of (W, H), order BL, BR, TR, TL.
 
 # Intensity / gradient thresholds (resolution-independent).
 DEFAULT_THRESHOLDS = {
@@ -190,9 +174,11 @@ class CVLaneDetector:
         or EMPTY_LANE (0, 2) when that lane is not reliably found.
     """
 
-    def __init__(self, image_size, calibration=None, distortion_model=None,
-                 proc_downscale=4, roi=DEFAULT_ROI, edge_thresholds=DEFAULT_THRESHOLDS,
+    def __init__(self, image_size, roi, calibration=None, distortion_model=None,
+                 proc_downscale=4, edge_thresholds=DEFAULT_THRESHOLDS,
                  spatial=DEFAULT_SPATIAL, undistort_balance=0.0):
+        if roi is None:
+            raise ValueError("roi (camera perspective trapezoid) is required")
         self.W, self.H = int(image_size[0]), int(image_size[1])
         self.proc_downscale = proc_downscale
         self.edge_thresholds = edge_thresholds

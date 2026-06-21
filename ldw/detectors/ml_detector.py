@@ -1,19 +1,18 @@
 """ML lane detector: Ultra-Fast-Lane-Detection-v2 (UFLDv2) on a TensorRT engine.
 
-A reusable detector (from the reference trt_test_speed.py) conforming to the
-LaneDetector contract: detect() returns the two ego-lane boundaries as points in
-undistorted original-image pixels.
+Conforms to the LaneDetector contract: detect() returns the two ego-lane
+boundaries as points in RAW original-image pixels (no undistortion — that is the
+LDW layer's job).
 
-Decoding matches how UFLDv2 was trained, fixing two bugs in the reference:
-  * y: class k sits at input-height v_k = (row_anchor[k]-(1-crop_ratio))/crop_ratio
-    (row_anchor = linspace(0.42,1,num_cls_row), crop_ratio = 0.6), not uniformly
-    over the crop -- the reference placed points up to ~20 px too high.
-  * x: expectation over a local window around the argmax (+0.5 cell), not a
-    global softmax over all grid cells.
+Preprocessing replicates UFLDv2's: resize the full frame width to the engine
+input and feed the bottom `crop_ratio` of the image. Decoding then maps each row
+class to its original-image row (y = row_anchor * H) and decodes x as a
+softmax-weighted mean grid index over a local window around the argmax. The two
+supported engines differ only in `crop_ratio` and `row_anchor` (see
+ENGINE_PRESETS), selected by the `dataset` argument.
 """
 
 import ctypes
-from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -121,63 +120,55 @@ class _TRTModel:
 _MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
+# The two engines this project uses. row_anchor = (start, end) as fractions of
+# image height (UFLDv2's training anchors, utils/common.py); crop_ratio is the
+# bottom fraction of the frame fed to the network.
+ENGINE_PRESETS = {
+    "culane":   {"crop_ratio": 0.6, "row_anchor": (0.42, 1.0)},
+    "tusimple": {"crop_ratio": 0.8, "row_anchor": (160 / 720, 710 / 720)},
+}
+ROW_LANE_IDX = (1, 2)  # the two ego lanes (left, right) in UFLDv2's lane ordering
+
 
 class MLLaneDetector:
-    """UFLDv2 ego-lane detector. Conforms to the LaneDetector contract."""
+    """UFLDv2 ego-lane detector. Conforms to the LaneDetector contract.
 
-    def __init__(
-        self,
-        engine_path: str,
-        image_size: Tuple[int, int] = (1920, 1080),
-        calibration: Optional[Tuple[np.ndarray, np.ndarray]] = None,
-        crop_ratio: float = 0.6,
-        row_anchor_start: float = 0.42,
-        row_anchor_end: float = 1.0,
-        last_n_rows: int = 750,
-        black_bar_ratio: float = 0.5,
-        row_lane_idx: Tuple[int, int] = (1, 2),
-        local_width: int = 1,
-    ):
-        self.model = _TRTModel(engine_path)
-        self.W, self.H = int(image_size[0]), int(image_size[1])
-        self.crop_ratio = crop_ratio
-        self.row_anchor_start = row_anchor_start
-        self.row_anchor_end = row_anchor_end
-        self.last_n_rows = last_n_rows
-        self.black_bar_ratio = black_bar_ratio
-        self.row_lane_idx = list(row_lane_idx)
+    Returns the two ego-lane boundaries as raw original-image pixels. `dataset`
+    selects the engine decode preset ("culane" or "tusimple").
+    """
+
+    def __init__(self, engine_path, dataset, image_size=(1920, 1080), local_width=1):
+        if dataset not in ENGINE_PRESETS:
+            raise ValueError(f"dataset must be one of {list(ENGINE_PRESETS)}")
+        preset = ENGINE_PRESETS[dataset]
+        crop_ratio = preset["crop_ratio"]
+        a0, a1 = preset["row_anchor"]
         self.local_width = local_width
 
-        self.K = self.D = None
-        if calibration is not None:
-            self.K = np.asarray(calibration[0], dtype=np.float32)
-            self.D = np.asarray(calibration[1], dtype=np.float32)
+        self.model = _TRTModel(engine_path)
+        self.W, self.H = int(image_size[0]), int(image_size[1])
 
-        # Input geometry from the engine.
+        # Input geometry + grid sizes from the engine.
         self.train_height = int(self.model.input_shape[2])
         self.train_width = int(self.model.input_shape[3])
-
         loc_row_shape = self.model.engine.get_tensor_shape("loc_row")
         self.num_grid_row = int(loc_row_shape[1])
         self.num_cls_row = int(loc_row_shape[2])
 
-        # Vertical anchors -> original-image y (the corrected mapping).
-        row_anchor = np.linspace(self.row_anchor_start, self.row_anchor_end, self.num_cls_row)
-        v = (row_anchor - (1.0 - self.crop_ratio)) / self.crop_ratio  # normalized input height
-        self.yi = (self.H - self.last_n_rows) + v * self.last_n_rows
+        # Preprocessing feeds the bottom crop_ratio of the frame (full width). Row
+        # anchors are fractions of the FULL image height, so class k sits at
+        # original-image row yi[k] = row_anchor[k] * H.
+        self.crop_rows = int(round(crop_ratio * self.H))
+        self.yi = np.linspace(a0, a1, self.num_cls_row) * self.H
 
     # ---- preprocessing (GPU) ------------------------------------------------
     def _preprocess(self, frame: np.ndarray) -> torch.Tensor:
         device = torch.device("cuda")
-        frame = frame[-self.last_n_rows:, :, :]
+        frame = frame[-self.crop_rows:, :, :]  # bottom crop_ratio of the image
         img = torch.from_numpy(frame).pin_memory().to(device, non_blocking=True, dtype=torch.float32)
-        img = img / 255.0
-        black_bar = int(self.train_width * self.black_bar_ratio)
-        img = img.permute(2, 0, 1).unsqueeze(0)
-        img = F.interpolate(img, size=(self.train_height, self.train_width - black_bar),
+        img = (img / 255.0).permute(2, 0, 1).unsqueeze(0)
+        img = F.interpolate(img, size=(self.train_height, self.train_width),
                             mode="bilinear", align_corners=False)
-        pad = black_bar // 2
-        img = F.pad(img, (pad, pad, 0, 0), mode="constant", value=0.0)
         mean = torch.from_numpy(_MEAN).to(device).view(1, -1, 1, 1)
         std = torch.from_numpy(_STD).to(device).view(1, -1, 1, 1)
         return (img - mean) / std
@@ -187,7 +178,7 @@ class MLLaneDetector:
         """logits [num_grid, num_cls, L] -> original-image x [num_cls, L].
 
         Per (class, lane): softmax-weighted mean grid index over a window of
-        +/-local_width around the argmax (+0.5), then black-bar removal + scale.
+        +/-local_width around the argmax (+0.5 cell), scaled to image width.
         """
         G = self.num_grid_row
         amax = logits.argmax(0)                                  # [C, L]
@@ -201,18 +192,15 @@ class MLLaneDetector:
         w = np.exp(w - w.max(0, keepdims=True))
         w /= w.sum(0, keepdims=True)
         g = (w * idx).sum(0) + 0.5                               # [C, L]
-
-        ratio = self.black_bar_ratio
-        return ((g / (G - 1) - ratio / 2.0) / (1.0 - ratio)) * self.W
+        return g / (G - 1) * self.W
 
     def _pred2coords(self, pred: dict) -> LaneList:
-        lane_idx = self.row_lane_idx
-        logits = pred["loc_row"][0][:, :, lane_idx]              # [num_grid, num_cls, L]
-        valid = pred["exist_row"][0].argmax(0)[:, lane_idx].astype(bool)  # [num_cls, L]
-        x = self._decode_x(logits)                              # [num_cls, L]
+        logits = pred["loc_row"][0][:, :, ROW_LANE_IDX]                   # [num_grid, num_cls, L]
+        valid = pred["exist_row"][0].argmax(0)[:, ROW_LANE_IDX].astype(bool)  # [num_cls, L]
+        x = self._decode_x(logits)                                        # [num_cls, L]
 
-        lanes: List[np.ndarray] = []
-        for j in range(len(lane_idx)):
+        lanes = []
+        for j in range(len(ROW_LANE_IDX)):
             m = valid[:, j]
             if m.sum() <= self.num_cls_row / 2:
                 lanes.append(EMPTY_LANE)
@@ -220,18 +208,10 @@ class MLLaneDetector:
                 lanes.append(np.column_stack([x[m, j], self.yi[m]]).astype(np.float32))
         return lanes
 
-    def _undistort(self, lane: np.ndarray) -> np.ndarray:
-        if self.K is None or len(lane) == 0:
-            return lane
-        pts = lane.reshape(-1, 1, 2).astype(np.float32)
-        return cv2.undistortPoints(pts, self.K, self.D, P=self.K).reshape(-1, 2)
-
     # ---- public API ---------------------------------------------------------
     def detect(self, frame_bgr: np.ndarray) -> LaneList:
         if (frame_bgr.shape[1], frame_bgr.shape[0]) != (self.W, self.H):
             frame_bgr = cv2.resize(frame_bgr, (self.W, self.H))
-        inp = self._preprocess(frame_bgr)
-        outputs = self.model.infer_torch(inp)
+        outputs = self.model.infer_torch(self._preprocess(frame_bgr))
         pred = {name: outputs[name] for name in self.model.output_names}
-        coords = self._pred2coords(pred)
-        return [self._undistort(lane) for lane in coords]
+        return self._pred2coords(pred)

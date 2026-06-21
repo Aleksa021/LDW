@@ -4,10 +4,10 @@
     python -m ldw.demo --detector cv        # CV pipeline on project_video.mp4
     python -m ldw.demo --detector cv --frames 30 --no-show   # headless sanity run
 
-Both detectors return undistorted original-pixel lane points; LDWSystem projects
-them into each camera's BEV via that camera's homography H, smooths, and warns.
-The two configs use different cameras/videos — to truly compare CV vs ML, feed
-the SAME footage + H to both.
+Both detectors return RAW original-pixel lane points; LDWSystem undistorts them
+and projects into each camera's BEV via that camera's homography H, smooths, and
+warns. The two configs use different cameras/videos — to truly compare CV vs ML,
+feed the SAME footage + camera to both.
 """
 
 import argparse
@@ -16,6 +16,7 @@ import os
 import cv2
 import numpy as np
 
+from ldw.cameras import CameraConfig
 from ldw.ldw_system import LDWSystem
 
 HERE = os.path.dirname(__file__)
@@ -36,17 +37,23 @@ ML_H = np.array([[-0.9699118924366116890, -6.692142227856339609, 2394.4514841535
                 dtype=np.float32)
 
 
+# CV perspective trapezoid for the project_video camera (original lane.py points).
+_PV_ROI = {
+    "src": [(194 / 1280, 719 / 720), (1117 / 1280, 719 / 720),
+            (705 / 1280, 461 / 720), (575 / 1280, 461 / 720)],
+    "dst": [(290 / 1280, 719 / 720), (990 / 1280, 719 / 720),
+            (990 / 1280, 0.0), (290 / 1280, 0.0)],
+}
+
+
 def build_ml():
     from ldw.detectors.ml_detector import MLLaneDetector
-    size = (1920, 1080)
-    det = MLLaneDetector(
-        engine_path=os.path.join(ML_DIR, "resources", "culane_res34.engine"),
-        image_size=size,
-        calibration=(ML_K, ML_D),
-    )
-    sys_ = LDWSystem(det, ML_H, image_size=size)
+    cam = CameraConfig(name="centar_grada", image_size=(1920, 1080),
+                       distortion_model="pinhole", K=ML_K, D=ML_D, cv_roi=None, H=ML_H)
+    det = MLLaneDetector(os.path.join(ML_DIR, "resources", "culane_res34.engine"),
+                         dataset="culane", image_size=cam.image_size)
     video = os.path.join(ML_DIR, "centar_grada_kraci.mp4")
-    return sys_, video, (ML_K, ML_D)
+    return LDWSystem(det, cam), video
 
 
 def build_cv():
@@ -56,18 +63,16 @@ def build_cv():
         sys.path.insert(0, CV_DIR)
     from calibration import load_calibration
 
-    size = (1280, 720)
     mtx, dist = load_calibration(os.path.join(CV_DIR, "camera_cal", "calibration_pickle.p"))
-    det = CVLaneDetector(image_size=size, calibration=(mtx, dist))
-
-    # Homography for the CV camera: the original lane.py trapezoid at full res.
     src = np.float32([[194, 719], [1117, 719], [705, 461], [575, 461]])
     dst = np.float32([[290, 719], [990, 719], [990, 0], [290, 0]])
     H_cv = cv2.getPerspectiveTransform(src, dst)
-
-    sys_ = LDWSystem(det, H_cv, image_size=size)
+    cam = CameraConfig(name="project_video", image_size=(1280, 720),
+                       distortion_model="pinhole", K=mtx, D=dist, cv_roi=_PV_ROI, H=H_cv)
+    det = CVLaneDetector(image_size=cam.image_size, roi=cam.cv_roi,
+                         calibration=cam.calibration, distortion_model=cam.distortion_model)
     video = os.path.join(CV_DIR, "examples", "project_video.mp4")
-    return sys_, video, (mtx, dist)
+    return LDWSystem(det, cam), video
 
 
 LANE_COLORS = [(0, 0, 255), (255, 0, 0)]  # left=red, right=blue
@@ -99,10 +104,9 @@ def main():
     p.add_argument("--no-show", action="store_true", help="headless; print stats only")
     args = p.parse_args()
 
-    system, video, calib = build_ml() if args.detector == "ml" else build_cv()
+    system, video = build_ml() if args.detector == "ml" else build_cv()
     if args.video:
         video = args.video
-    mtx, dist = calib
 
     cap = cv2.VideoCapture(video)
     n, warnings, found = 0, 0, 0
@@ -116,8 +120,7 @@ def main():
         found += int(len(result.lanes_px[0]) > 0 and len(result.lanes_px[1]) > 0)
 
         if not args.no_show:
-            view = cv2.undistort(cv2.resize(frame, (system.W, system.H_img)), mtx, dist, None, mtx)
-            view = draw(view, result)
+            view = draw(cv2.resize(frame, (system.W, system.H_img)), result)
             cv2.imshow(f"LDW [{args.detector}]", cv2.resize(view, (1280, 720)))
             if cv2.waitKey(1) & 0xFF == 27:
                 break
