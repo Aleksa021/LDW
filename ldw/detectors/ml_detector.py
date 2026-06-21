@@ -132,6 +132,7 @@ class MLLaneDetector:
         calibration: Optional[Tuple[np.ndarray, np.ndarray]] = None,
         crop_ratio: float = 0.6,
         row_anchor_start: float = 0.42,
+        row_anchor_end: float = 1.0,
         last_n_rows: int = 750,
         black_bar_ratio: float = 0.5,
         row_lane_idx: Tuple[int, int] = (1, 2),
@@ -141,6 +142,7 @@ class MLLaneDetector:
         self.W, self.H = int(image_size[0]), int(image_size[1])
         self.crop_ratio = crop_ratio
         self.row_anchor_start = row_anchor_start
+        self.row_anchor_end = row_anchor_end
         self.last_n_rows = last_n_rows
         self.black_bar_ratio = black_bar_ratio
         self.row_lane_idx = list(row_lane_idx)
@@ -160,7 +162,7 @@ class MLLaneDetector:
         self.num_cls_row = int(loc_row_shape[2])
 
         # Vertical anchors -> original-image y (the corrected mapping).
-        row_anchor = np.linspace(self.row_anchor_start, 1.0, self.num_cls_row)
+        row_anchor = np.linspace(self.row_anchor_start, self.row_anchor_end, self.num_cls_row)
         v = (row_anchor - (1.0 - self.crop_ratio)) / self.crop_ratio  # normalized input height
         self.yi = (self.H - self.last_n_rows) + v * self.last_n_rows
 
