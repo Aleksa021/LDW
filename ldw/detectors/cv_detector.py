@@ -43,19 +43,21 @@ __all__ = ["CVLaneDetector"]
 
 # Intensity / gradient thresholds (resolution-independent).
 DEFAULT_THRESHOLDS = {
-    "s_thresh": (120, 255),
+    "s_thresh": (140, 255),      # HLS S floor raised 120->140 (less noise; sweep-tuned)
     "sx_thresh": (20, 100),
     "dir_thresh": (0.7, 1.3),
 }
 
 # Spatial constants as fractions of the WORKING width/height. These reproduce the
 # original 1280x720 hardcoded values (working width was 320): 100/4=25 -> ~0.08*320.
+# crop_*_frac symmetric at 150 orig px each side (150/1920=0.0781); parallel gate
+# loosened 0.066->0.16 to recover recall (Jiqing sweep on 0249-0251).
 DEFAULT_SPATIAL = {
     "margin_frac": 0.078,        # sliding-window half-width (frac of working W)
     "minpix_frac": 0.039,        # recenter threshold (frac of working W)
-    "crop_left_frac": 0.117,     # left crop (frac of working W)
-    "crop_right_frac": 0.0625,   # right crop (frac of working W)
-    "parallel_std_frac": 0.066,  # max std of lane-width for a trusted fit
+    "crop_left_frac": 0.0781,    # left crop (frac of working W) = 150 orig px
+    "crop_right_frac": 0.0781,   # right crop (frac of working W) = 150 orig px
+    "parallel_std_frac": 0.16,   # max std of lane-width for a trusted fit
     "min_fit_pixels": 50,        # min inlier pixels (working res) to attempt a fit
 }
 
