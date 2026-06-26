@@ -33,10 +33,10 @@ class CameraConfig:
 
 
 # CV perspective trapezoid for the Jiqing camera, in the undistorted view where
-# CV detection happens. Fractions of (W, H), order BL, BR, TR, TL. Tuned from the
-# undistorted ego-lane geometry.
+# CV detection happens. Fractions of (W, H), order BL, BR, TR, TL. Calibrated with
+# scripts/pick_bev_roi.py on IMG_0310 @ 13s (frame 390).
 _JIQING_CV_ROI = {
-    "src": [(0.22, 0.86), (0.78, 0.86), (0.575, 0.60), (0.445, 0.60)],
+    "src": [(0.1927, 0.8426), (0.7977, 0.8429), (0.5738, 0.6), (0.4669, 0.6)],
     "dst": [(0.2266, 1.0), (0.7734, 1.0), (0.7734, 0.0), (0.2266, 0.0)],
 }
 
